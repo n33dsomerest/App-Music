@@ -114,8 +114,8 @@ class DownloadManager {
       _activeProgress[track.id] = 0.0;
       _progressController.add(Map.unmodifiable(_activeProgress));
 
-      // 2. Fetch fresh stream URL
-      final streamResult = await _musicSource.getStreamUrl(track.id);
+      // 2. Fetch fresh stream data (audio stream + metadata in 1 call)
+      final streamData = await _musicSource.getAudioStreamData(track.id);
 
       // 3. Prepare target file path in app documents directory
       final docsDir = await getApplicationDocumentsDirectory();
@@ -124,7 +124,7 @@ class DownloadManager {
         await downloadsDir.create(recursive: true);
       }
 
-      final extension = streamResult.container.isNotEmpty ? streamResult.container : 'm4a';
+      final extension = streamData.container.isNotEmpty ? streamData.container : 'm4a';
       final sanitizedTitle = track.id.replaceAll(RegExp(r'[^\w\.-]'), '_');
       final targetFilePath = p.join(downloadsDir.path, '$sanitizedTitle.$extension');
       final tempFilePath = '$targetFilePath.part';
@@ -133,14 +133,14 @@ class DownloadManager {
 
       // 4. Download stream bytes directly via MusicSource to bypass 403 Forbidden
       try {
-        final byteStream = await _musicSource.getAudioStream(track.id);
+        final byteStream = streamData.stream;
         final tempFile = File(tempFilePath);
         if (await tempFile.exists()) {
           await tempFile.delete();
         }
         final sink = tempFile.openWrite();
 
-        final totalBytes = streamResult.sizeBytes;
+        final totalBytes = streamData.sizeBytes;
         int downloadedBytes = 0;
 
         await for (final chunk in byteStream) {
@@ -177,12 +177,19 @@ class DownloadManager {
       } catch (streamErr) {
         AppLogger.warn('DownloadManager', 'Byte stream failed, falling back to Dio with headers: $streamErr');
         // Fallback to Dio with YouTube headers
+        final fallbackStreamUrl = streamData.url?.toString() ??
+            (await _musicSource.getStreamUrl(track.id)).url.toString();
         await _dio.download(
-          streamResult.url.toString(),
+          fallbackStreamUrl,
           tempFilePath,
           cancelToken: cancelToken,
           options: Options(
-            headers: streamResult.headers,
+            headers: const {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              'Referer': 'https://www.youtube.com/',
+              'Origin': 'https://www.youtube.com',
+            },
           ),
           onReceiveProgress: (received, total) {
             if (total > 0) {

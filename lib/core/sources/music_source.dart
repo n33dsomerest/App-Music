@@ -111,6 +111,7 @@ class AudioStreamInfoResult {
   final int bitrate;
   final String container;
   final int sizeBytes;
+  final List<Uri> fallbackUrls;
   final Map<String, String> headers;
 
   const AudioStreamInfoResult({
@@ -118,6 +119,7 @@ class AudioStreamInfoResult {
     required this.bitrate,
     required this.container,
     required this.sizeBytes,
+    this.fallbackUrls = const [],
     this.headers = const {
       'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -127,12 +129,29 @@ class AudioStreamInfoResult {
   });
 }
 
+class AudioStreamData {
+  final Stream<List<int>> stream;
+  final int sizeBytes;
+  final String container;
+  final int bitrate;
+  final Uri? url;
+
+  const AudioStreamData({
+    required this.stream,
+    required this.sizeBytes,
+    required this.container,
+    required this.bitrate,
+    this.url,
+  });
+}
+
 abstract class MusicSource {
   Future<List<TrackInfo>> search(String query);
   Future<List<TrackInfo>> getTrending();
   Future<List<TrackInfo>> getRelatedTracks(String videoId, {int limit = 10});
   Future<AudioStreamInfoResult> getStreamUrl(String videoId);
   Future<Stream<List<int>>> getAudioStream(String videoId);
+  Future<AudioStreamData> getAudioStreamData(String videoId);
   Future<TrackInfo> getTrackDetails(String videoId);
   void dispose();
 }

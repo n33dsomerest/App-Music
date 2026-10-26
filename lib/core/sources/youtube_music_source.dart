@@ -79,39 +79,80 @@ class YoutubeMusicSource implements MusicSource {
     }
   }
 
+  Future<StreamManifest> _getStreamManifest(String videoId) async {
+    // 1. Try merged multi-client manifest (Android, iOS, AndroidVR, TV)
+    try {
+      return await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [
+          YoutubeApiClient.android,
+          YoutubeApiClient.ios,
+          YoutubeApiClient.androidVr,
+          YoutubeApiClient.tv,
+        ],
+      );
+    } catch (e1) {
+      AppLogger.warn('MusicSource', 'Merged ytClients manifest failed: $e1, trying Android client');
+    }
+
+    // 2. Try Android client alone
+    try {
+      return await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.android],
+      );
+    } catch (e2) {
+      AppLogger.warn('MusicSource', 'Android client manifest failed: $e2, trying iOS client');
+    }
+
+    // 3. Try iOS client alone
+    try {
+      return await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.ios],
+      );
+    } catch (e3) {
+      AppLogger.warn('MusicSource', 'iOS client manifest failed: $e3, trying default client');
+    }
+
+    // 4. Fallback to default client
+    return await _yt.videos.streamsClient.getManifest(videoId);
+  }
+
   @override
   Future<AudioStreamInfoResult> getStreamUrl(String videoId) async {
     AppLogger.info('MusicSource', 'Fetching stream manifest for: $videoId');
     try {
-      StreamManifest manifest;
-      try {
-        // Preferred clients to bypass YouTube 403 Forbidden blocks
-        manifest = await _yt.videos.streamsClient.getManifest(
-          videoId,
-          ytClients: [
-            YoutubeApiClient.androidVr,
-            YoutubeApiClient.ios,
-            YoutubeApiClient.safari,
-          ],
-        );
-      } catch (_) {
-        manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      }
+      final manifest = await _getStreamManifest(videoId);
 
-      final audioStreams = manifest.audioOnly.isNotEmpty
-          ? manifest.audioOnly
-          : manifest.muxed;
-      if (audioStreams.isEmpty) {
+      final allAudio = manifest.audioOnly.isNotEmpty
+          ? manifest.audioOnly.toList()
+          : manifest.muxed.toList();
+      if (allAudio.isEmpty) {
         throw MusicSourceException('No audio streams available for track $videoId');
       }
 
-      final bestAudio = audioStreams.withHighestBitrate();
-      AppLogger.info('MusicSource', 'Resolved best audio stream: ${bestAudio.container.name}, ${bestAudio.bitrate.bitsPerSecond} bps, ${bestAudio.size.totalMegaBytes.toStringAsFixed(2)} MB');
+      // Prioritize M4A (AAC) streams for native Android ExoPlayer & iOS AVPlayer compatibility
+      allAudio.sort((a, b) {
+        final aIsM4a = a.container.name.toLowerCase() == 'm4a' ||
+            a.container.name.toLowerCase() == 'mp4';
+        final bIsM4a = b.container.name.toLowerCase() == 'm4a' ||
+            b.container.name.toLowerCase() == 'mp4';
+        if (aIsM4a && !bIsM4a) return -1;
+        if (!aIsM4a && bIsM4a) return 1;
+        return b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond);
+      });
+
+      final bestAudio = allAudio.first;
+      final fallbackUrls = allAudio.skip(1).take(4).map((s) => s.url).toList();
+
+      AppLogger.info('MusicSource', 'Resolved best audio stream: ${bestAudio.container.name}, ${bestAudio.bitrate.bitsPerSecond} bps, ${bestAudio.size.totalMegaBytes.toStringAsFixed(2)} MB (${fallbackUrls.length} fallbacks)');
       return AudioStreamInfoResult(
         url: bestAudio.url,
         bitrate: bestAudio.bitrate.bitsPerSecond,
         container: bestAudio.container.name,
         sizeBytes: bestAudio.size.totalBytes,
+        fallbackUrls: fallbackUrls,
       );
     } catch (e, st) {
       AppLogger.error('MusicSource', 'Failed to get stream URL for $videoId', e, st);
@@ -120,31 +161,49 @@ class YoutubeMusicSource implements MusicSource {
   }
 
   @override
-  Future<Stream<List<int>>> getAudioStream(String videoId) async {
+  Future<AudioStreamData> getAudioStreamData(String videoId) async {
+    AppLogger.info('MusicSource', 'Fetching audio stream data for: $videoId');
     try {
-      StreamManifest manifest;
-      try {
-        manifest = await _yt.videos.streamsClient.getManifest(
-          videoId,
-          ytClients: [
-            YoutubeApiClient.androidVr,
-            YoutubeApiClient.ios,
-            YoutubeApiClient.safari,
-          ],
-        );
-      } catch (_) {
-        manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      }
-
-      final audioStreams = manifest.audioOnly.isNotEmpty
-          ? manifest.audioOnly
-          : manifest.muxed;
-      if (audioStreams.isEmpty) {
+      final manifest = await _getStreamManifest(videoId);
+      final allAudio = manifest.audioOnly.isNotEmpty
+          ? manifest.audioOnly.toList()
+          : manifest.muxed.toList();
+      if (allAudio.isEmpty) {
         throw MusicSourceException('No audio streams available for track $videoId');
       }
 
-      final bestAudio = audioStreams.withHighestBitrate();
-      return _yt.videos.streamsClient.get(bestAudio);
+      allAudio.sort((a, b) {
+        final aIsM4a = a.container.name.toLowerCase() == 'm4a' ||
+            a.container.name.toLowerCase() == 'mp4';
+        final bIsM4a = b.container.name.toLowerCase() == 'm4a' ||
+            b.container.name.toLowerCase() == 'mp4';
+        if (aIsM4a && !bIsM4a) return -1;
+        if (!aIsM4a && bIsM4a) return 1;
+        return b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond);
+      });
+
+      final bestAudio = allAudio.first;
+      AppLogger.info('MusicSource', 'Selected stream for $videoId: ${bestAudio.container.name}, ${bestAudio.bitrate.bitsPerSecond} bps, ${(bestAudio.size.totalBytes / (1024 * 1024)).toStringAsFixed(2)} MB');
+
+      final stream = _yt.videos.streamsClient.get(bestAudio);
+      return AudioStreamData(
+        stream: stream,
+        sizeBytes: bestAudio.size.totalBytes,
+        container: bestAudio.container.name,
+        bitrate: bestAudio.bitrate.bitsPerSecond,
+        url: bestAudio.url,
+      );
+    } catch (e, st) {
+      AppLogger.error('MusicSource', 'Failed to get audio stream data for $videoId', e, st);
+      throw MusicSourceException('Failed to get audio stream data for $videoId: $e', e);
+    }
+  }
+
+  @override
+  Future<Stream<List<int>>> getAudioStream(String videoId) async {
+    try {
+      final data = await getAudioStreamData(videoId);
+      return data.stream;
     } catch (e, st) {
       AppLogger.error('MusicSource', 'Failed to open audio byte stream for $videoId', e, st);
       throw MusicSourceException('Failed to open audio stream for $videoId: $e', e);

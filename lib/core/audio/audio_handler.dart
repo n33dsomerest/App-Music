@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:io';
 import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import '../database/app_database.dart';
 import '../sources/music_source.dart';
 import '../utils/app_logger.dart';
+import 'youtube_stream_audio_source.dart';
 
 class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final AudioPlayer _player = AudioPlayer();
@@ -110,12 +113,12 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     mediaItem.add(track.toMediaItem());
 
     try {
-      // 1. Check if track is available offline locally
+      // 1. Check if track is available offline locally from downloads
       if (track.localFilePath != null && track.localFilePath!.isNotEmpty) {
         final localFile = File(track.localFilePath!);
         if (await localFile.exists()) {
           AppLogger.info('AudioHandler', 'Playing from local file: ${localFile.path}');
-          await _player.setAudioSource(AudioSource.file(localFile.path));
+          await _player.setAudioSource(AudioSource.file(localFile.path, tag: track.toMediaItem()));
           await _player.play();
           return;
         }
@@ -129,35 +132,98 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         final file = File(downloadEntry.localFilePath);
         if (await file.exists()) {
           AppLogger.info('AudioHandler', 'Playing from offline DB download: ${file.path}');
-          await _player.setAudioSource(AudioSource.file(file.path));
+          await _player.setAudioSource(AudioSource.file(file.path, tag: track.toMediaItem()));
           await _player.play();
           return;
         }
       }
 
-      // 2. Stream online via MusicSource (resolves fresh stream URL)
-      AppLogger.info('AudioHandler', 'Resolving fresh online stream URL for ${track.id}...');
-      final streamInfo = await _musicSource.getStreamUrl(track.id);
-      AppLogger.info('AudioHandler', 'Stream URL resolved (${streamInfo.bitrate} bps, ${streamInfo.container})');
-      await _player.setAudioSource(
-        AudioSource.uri(
-          streamInfo.url,
+      // 2. Check if track is cached in temporary cache directory
+      final cachedFile = await _getCacheFile(track.id);
+      if (await cachedFile.exists() && await cachedFile.length() > 1024) {
+        AppLogger.info('AudioHandler', 'Playing from local disk cache: ${cachedFile.path}');
+        await _player.setAudioSource(AudioSource.file(cachedFile.path, tag: track.toMediaItem()));
+        await _player.play();
+        return;
+      }
+
+      // 3. Stream directly using YoutubeStreamAudioSource
+      // Native YouTubeExplode streamClient handles chunks with verified headers,
+      // avoiding Google Video CDN HTTP 403 Forbidden blocks.
+      try {
+        AppLogger.info('AudioHandler', 'Opening verified audio stream via MusicSource for ${track.id}...');
+        final streamData = await _musicSource.getAudioStreamData(track.id);
+        final targetCacheFile = await _getCacheFile(track.id, streamData.container);
+
+        final source = YoutubeStreamAudioSource(
+          streamSupplier: () async => streamData.stream,
+          sourceLength: streamData.sizeBytes > 0 ? streamData.sizeBytes : null,
+          contentType: streamData.container.toLowerCase().contains('webm')
+              ? 'audio/webm'
+              : 'audio/mp4',
+          cacheFile: targetCacheFile,
           tag: track.toMediaItem(),
-          headers: streamInfo.headers,
-        ),
-      );
+        );
+
+        await _player.setAudioSource(source);
+        await _player.play();
+        AppLogger.info('AudioHandler', 'Verified stream playback started successfully for "${track.title}"');
+        return;
+      } catch (streamErr, streamSt) {
+        AppLogger.warn('AudioHandler', 'YoutubeStreamAudioSource encountered error ($streamErr), attempting candidate URL fallback...');
+      }
+
+      // 4. Fallback: Stream online via candidate URLs
+      AppLogger.info('AudioHandler', 'Resolving fallback online stream URLs for ${track.id}...');
+      final streamInfo = await _musicSource.getStreamUrl(track.id);
+      final urlsToTry = [streamInfo.url, ...streamInfo.fallbackUrls];
+      bool loaded = false;
+      Object? lastError;
+
+      for (var i = 0; i < urlsToTry.length; i++) {
+        final candidateUrl = urlsToTry[i];
+        try {
+          AppLogger.info('AudioHandler', 'Attempting audio stream candidate (${i + 1}/${urlsToTry.length})');
+          await _player.setAudioSource(
+            AudioSource.uri(
+              candidateUrl,
+              tag: track.toMediaItem(),
+            ),
+          );
+          loaded = true;
+          break;
+        } catch (sourceErr) {
+          lastError = sourceErr;
+          AppLogger.warn('AudioHandler', 'Stream candidate ${i + 1} failed: $sourceErr');
+        }
+      }
+
+      if (!loaded) {
+        throw lastError ?? Exception('Failed to load any audio stream');
+      }
+
       await _player.play();
-      AppLogger.info('AudioHandler', 'Playback started successfully for "${track.title}"');
+      AppLogger.info('AudioHandler', 'Fallback URL playback started successfully for "${track.title}"');
     } catch (e, st) {
       if (!isRetry) {
         AppLogger.warn('AudioHandler', 'Playback failed, refreshing stream and retrying... Error: $e');
-        // Stream URLs can expire or get throttled; retry once with a refreshed URL
         await Future.delayed(const Duration(milliseconds: 500));
         return _prepareAndPlayTrack(track, isRetry: true);
       }
       AppLogger.error('AudioHandler', 'Failed to play track "${track.title}" (${track.id})', e, st);
       rethrow;
     }
+  }
+
+  Future<File> _getCacheFile(String trackId, [String extension = 'm4a']) async {
+    final tempDir = await getTemporaryDirectory();
+    final cacheDir = Directory(p.join(tempDir.path, 'music_apl_cache'));
+    if (!await cacheDir.exists()) {
+      await cacheDir.create(recursive: true);
+    }
+    final sanitizedId = trackId.replaceAll(RegExp(r'[^\w\.-]'), '_');
+    final ext = extension.isNotEmpty ? extension : 'm4a';
+    return File(p.join(cacheDir.path, '$sanitizedId.$ext'));
   }
 
   void _logCurrentTrackPlay({bool isCompleted = false}) {
