@@ -81,7 +81,7 @@ class MiniPlayer extends ConsumerWidget {
                     // Title & Artist
                     Expanded(
                       child: Column(
-                        crossContent: CrossAxisAlignment.start,
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(

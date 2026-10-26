@@ -79,7 +79,7 @@ class TrackTile extends ConsumerWidget {
             // Track metadata
             Expanded(
               child: Column(
-                crossContent: CrossAxisAlignment.start,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     track.title,

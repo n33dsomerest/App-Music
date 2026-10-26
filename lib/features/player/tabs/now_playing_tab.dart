@@ -100,7 +100,7 @@ class _NowPlayingTabState extends ConsumerState<NowPlayingTab> {
             children: [
               Expanded(
                 child: Column(
-                  crossContent: CrossAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
                       widget.track.title,
