@@ -111,12 +111,19 @@ class AudioStreamInfoResult {
   final int bitrate;
   final String container;
   final int sizeBytes;
+  final Map<String, String> headers;
 
   const AudioStreamInfoResult({
     required this.url,
     required this.bitrate,
     required this.container,
     required this.sizeBytes,
+    this.headers = const {
+      'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      'Referer': 'https://www.youtube.com/',
+      'Origin': 'https://www.youtube.com',
+    },
   });
 }
 
@@ -125,6 +132,7 @@ abstract class MusicSource {
   Future<List<TrackInfo>> getTrending();
   Future<List<TrackInfo>> getRelatedTracks(String videoId, {int limit = 10});
   Future<AudioStreamInfoResult> getStreamUrl(String videoId);
+  Future<Stream<List<int>>> getAudioStream(String videoId);
   Future<TrackInfo> getTrackDetails(String videoId);
   void dispose();
 }

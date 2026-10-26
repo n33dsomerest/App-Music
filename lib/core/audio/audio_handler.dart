@@ -143,6 +143,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         AudioSource.uri(
           streamInfo.url,
           tag: track.toMediaItem(),
+          headers: streamInfo.headers,
         ),
       );
       await _player.play();

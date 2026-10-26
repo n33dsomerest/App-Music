@@ -83,8 +83,24 @@ class YoutubeMusicSource implements MusicSource {
   Future<AudioStreamInfoResult> getStreamUrl(String videoId) async {
     AppLogger.info('MusicSource', 'Fetching stream manifest for: $videoId');
     try {
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final audioStreams = manifest.audioOnly;
+      StreamManifest manifest;
+      try {
+        // Preferred clients to bypass YouTube 403 Forbidden blocks
+        manifest = await _yt.videos.streamsClient.getManifest(
+          videoId,
+          ytClients: [
+            YoutubeApiClient.androidVr,
+            YoutubeApiClient.ios,
+            YoutubeApiClient.safari,
+          ],
+        );
+      } catch (_) {
+        manifest = await _yt.videos.streamsClient.getManifest(videoId);
+      }
+
+      final audioStreams = manifest.audioOnly.isNotEmpty
+          ? manifest.audioOnly
+          : manifest.muxed;
       if (audioStreams.isEmpty) {
         throw MusicSourceException('No audio streams available for track $videoId');
       }
@@ -100,6 +116,38 @@ class YoutubeMusicSource implements MusicSource {
     } catch (e, st) {
       AppLogger.error('MusicSource', 'Failed to get stream URL for $videoId', e, st);
       throw MusicSourceException('Failed to get audio stream URL for $videoId: $e', e);
+    }
+  }
+
+  @override
+  Future<Stream<List<int>>> getAudioStream(String videoId) async {
+    try {
+      StreamManifest manifest;
+      try {
+        manifest = await _yt.videos.streamsClient.getManifest(
+          videoId,
+          ytClients: [
+            YoutubeApiClient.androidVr,
+            YoutubeApiClient.ios,
+            YoutubeApiClient.safari,
+          ],
+        );
+      } catch (_) {
+        manifest = await _yt.videos.streamsClient.getManifest(videoId);
+      }
+
+      final audioStreams = manifest.audioOnly.isNotEmpty
+          ? manifest.audioOnly
+          : manifest.muxed;
+      if (audioStreams.isEmpty) {
+        throw MusicSourceException('No audio streams available for track $videoId');
+      }
+
+      final bestAudio = audioStreams.withHighestBitrate();
+      return _yt.videos.streamsClient.get(bestAudio);
+    } catch (e, st) {
+      AppLogger.error('MusicSource', 'Failed to open audio byte stream for $videoId', e, st);
+      throw MusicSourceException('Failed to open audio stream for $videoId: $e', e);
     }
   }
 

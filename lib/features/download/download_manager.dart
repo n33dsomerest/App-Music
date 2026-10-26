@@ -131,18 +131,35 @@ class DownloadManager {
 
       DateTime lastDbUpdate = DateTime.now();
 
-      // 4. Download file with progress updates
-      await _dio.download(
-        streamResult.url.toString(),
-        tempFilePath,
-        cancelToken: cancelToken,
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            final progress = (received / total).clamp(0.0, 1.0);
+      // 4. Download stream bytes directly via MusicSource to bypass 403 Forbidden
+      try {
+        final byteStream = await _musicSource.getAudioStream(track.id);
+        final tempFile = File(tempFilePath);
+        if (await tempFile.exists()) {
+          await tempFile.delete();
+        }
+        final sink = tempFile.openWrite();
+
+        final totalBytes = streamResult.sizeBytes;
+        int downloadedBytes = 0;
+
+        await for (final chunk in byteStream) {
+          if (cancelToken.isCancelled) {
+            await sink.close();
+            if (await tempFile.exists()) {
+              await tempFile.delete();
+            }
+            return;
+          }
+
+          sink.add(chunk);
+          downloadedBytes += chunk.length;
+
+          if (totalBytes > 0) {
+            final progress = (downloadedBytes / totalBytes).clamp(0.0, 1.0);
             _activeProgress[track.id] = progress;
             _progressController.add(Map.unmodifiable(_activeProgress));
 
-            // Throttle DB updates to once every 600ms
             final now = DateTime.now();
             if (now.difference(lastDbUpdate).inMilliseconds > 600) {
               lastDbUpdate = now;
@@ -153,8 +170,39 @@ class DownloadManager {
               );
             }
           }
-        },
-      );
+        }
+
+        await sink.flush();
+        await sink.close();
+      } catch (streamErr) {
+        AppLogger.warn('DownloadManager', 'Byte stream failed, falling back to Dio with headers: $streamErr');
+        // Fallback to Dio with YouTube headers
+        await _dio.download(
+          streamResult.url.toString(),
+          tempFilePath,
+          cancelToken: cancelToken,
+          options: Options(
+            headers: streamResult.headers,
+          ),
+          onReceiveProgress: (received, total) {
+            if (total > 0) {
+              final progress = (received / total).clamp(0.0, 1.0);
+              _activeProgress[track.id] = progress;
+              _progressController.add(Map.unmodifiable(_activeProgress));
+
+              final now = DateTime.now();
+              if (now.difference(lastDbUpdate).inMilliseconds > 600) {
+                lastDbUpdate = now;
+                _database.updateDownloadStatus(
+                  videoId: track.id,
+                  status: 'downloading',
+                  progress: progress,
+                );
+              }
+            }
+          },
+        );
+      }
 
       // 5. Rename temporary file to target file
       final tempFile = File(tempFilePath);
