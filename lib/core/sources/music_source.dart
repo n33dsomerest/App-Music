@@ -135,6 +135,7 @@ class AudioStreamData {
   final String container;
   final int bitrate;
   final Uri? url;
+  final int totalAvailableStreams;
 
   const AudioStreamData({
     required this.stream,
@@ -142,6 +143,7 @@ class AudioStreamData {
     required this.container,
     required this.bitrate,
     this.url,
+    this.totalAvailableStreams = 1,
   });
 }
 
@@ -151,7 +153,7 @@ abstract class MusicSource {
   Future<List<TrackInfo>> getRelatedTracks(String videoId, {int limit = 10});
   Future<AudioStreamInfoResult> getStreamUrl(String videoId);
   Future<Stream<List<int>>> getAudioStream(String videoId);
-  Future<AudioStreamData> getAudioStreamData(String videoId);
+  Future<AudioStreamData> getAudioStreamData(String videoId, {int attemptIndex = 0, Set<String>? excludeUrls});
   Future<TrackInfo> getTrackDetails(String videoId);
   void dispose();
 }

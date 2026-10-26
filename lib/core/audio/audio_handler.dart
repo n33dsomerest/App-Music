@@ -123,40 +123,43 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     ));
 
     try {
-      // ── Step 1: Try playing from an existing local file ──
+      // ── Step 1: Try playing from an existing local file (skip if isRetry == true) ──
+      if (!isRetry) {
+        // 1a. Track model has a local path (e.g. from a download tile)
+        if (track.localFilePath != null && track.localFilePath!.isNotEmpty) {
+          final localFile = File(track.localFilePath!);
+          if (await localFile.exists()) {
+            AppLogger.info('AudioHandler', 'Playing from local file: ${localFile.path}');
+            await _setSourceAndPlay(localFile.path, track);
+            return;
+          }
+        }
 
-      // 1a. Track model has a local path (e.g. from a download tile)
-      if (track.localFilePath != null && track.localFilePath!.isNotEmpty) {
-        final localFile = File(track.localFilePath!);
-        if (await localFile.exists()) {
-          AppLogger.info('AudioHandler', 'Playing from local file: ${localFile.path}');
-          await _setSourceAndPlay(localFile.path, track);
+        // 1b. A completed download exists in the DB
+        final downloadEntry = await _database.getDownload(track.id);
+        if (downloadEntry != null &&
+            downloadEntry.status == 'completed' &&
+            downloadEntry.localFilePath.isNotEmpty) {
+          final file = File(downloadEntry.localFilePath);
+          if (await file.exists()) {
+            AppLogger.info('AudioHandler', 'Playing from offline DB download: ${file.path}');
+            await _setSourceAndPlay(file.path, track);
+            return;
+          }
+        }
+
+        // 1c. A previous stream-cache file exists on disk (must be >= 100 KB)
+        final existingCache = await _findCacheFile(track.id);
+        if (existingCache != null && await existingCache.length() >= 102400) {
+          AppLogger.info('AudioHandler', 'Playing from cached stream file: ${existingCache.path}');
+          await _setSourceAndPlay(existingCache.path, track);
           return;
         }
+      } else {
+        AppLogger.info('AudioHandler', 'Retry requested: skipping cache lookups to force a fresh download');
       }
 
-      // 1b. A completed download exists in the DB
-      final downloadEntry = await _database.getDownload(track.id);
-      if (downloadEntry != null &&
-          downloadEntry.status == 'completed' &&
-          downloadEntry.localFilePath.isNotEmpty) {
-        final file = File(downloadEntry.localFilePath);
-        if (await file.exists()) {
-          AppLogger.info('AudioHandler', 'Playing from offline DB download: ${file.path}');
-          await _setSourceAndPlay(file.path, track);
-          return;
-        }
-      }
-
-      // 1c. A previous stream-cache file exists on disk
-      final existingCache = await _findCacheFile(track.id);
-      if (existingCache != null && await existingCache.length() > 4096) {
-        AppLogger.info('AudioHandler', 'Playing from cached stream file: ${existingCache.path}');
-        await _setSourceAndPlay(existingCache.path, track);
-        return;
-      }
-
-      // ── Step 2: Download the audio stream to a temp file, then play ──
+      // ── Step 2: Download the audio stream to a temp file, validate, then play ──
       //
       // youtube_explode_dart's streamsClient.get() performs the HTTP request
       // using its own YoutubeHttpClient with the correct User-Agent, cookies,
@@ -164,51 +167,135 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       // Stream<List<int>>.  We write them to disk and hand the *local* file
       // path to just_audio — ExoPlayer never touches googlevideo.com.
 
-      AppLogger.info('AudioHandler', 'Downloading audio via youtube_explode for ${track.id}…');
-      final streamData = await _musicSource.getAudioStreamData(track.id);
-      final ext = (streamData.container.isNotEmpty) ? streamData.container : 'm4a';
-      final cacheFile = await _makeCacheFile(track.id, ext);
-      final tempFile  = File('${cacheFile.path}.part');
+      final failedUrls = <String>{};
+      int streamAttempt = 0;
+      const maxStreamAttempts = 3;
+      File? verifiedFile;
 
-      // Delete stale partial download if it exists
-      if (await tempFile.exists()) await tempFile.delete();
-
-      final sink = tempFile.openWrite();
-      int bytesWritten = 0;
-      final totalBytes = streamData.sizeBytes;
-      final sw = Stopwatch()..start();
-
-      await for (final chunk in streamData.stream) {
-        sink.add(chunk);
-        bytesWritten += chunk.length;
-
-        // Log progress every ~2 s so the user can see something in Settings
-        if (sw.elapsedMilliseconds > 2000) {
-          final pct = totalBytes > 0
-              ? ((bytesWritten / totalBytes) * 100).toStringAsFixed(0)
-              : '?';
+      while (streamAttempt < maxStreamAttempts && verifiedFile == null) {
+        try {
           AppLogger.info('AudioHandler',
-              'Buffering ${track.id}: $bytesWritten / $totalBytes bytes ($pct %)');
-          sw.reset();
+              'Downloading audio via youtube_explode for ${track.id} (stream attempt: $streamAttempt)…');
+          final streamData = await _musicSource.getAudioStreamData(
+            track.id,
+            attemptIndex: streamAttempt,
+            excludeUrls: failedUrls,
+          );
+          if (streamData.url != null) {
+            failedUrls.add(streamData.url.toString());
+          }
+
+          final ext = streamData.container.isNotEmpty ? streamData.container : 'm4a';
+          final cacheFile = await _makeCacheFile(track.id, ext);
+          final tempFile = File('${cacheFile.path}.part');
+
+          // Delete stale partial download if it exists
+          if (await tempFile.exists()) await tempFile.delete();
+
+          final sink = tempFile.openWrite();
+          int bytesWritten = 0;
+          final totalBytes = streamData.sizeBytes;
+          final sw = Stopwatch()..start();
+
+          try {
+            await for (final chunk in streamData.stream) {
+              sink.add(chunk);
+              bytesWritten += chunk.length;
+
+              // Log progress every ~2 s so the user can see something in Settings
+              if (sw.elapsedMilliseconds > 2000) {
+                final pct = totalBytes > 0
+                    ? ((bytesWritten / totalBytes) * 100).toStringAsFixed(0)
+                    : '?';
+                AppLogger.info('AudioHandler',
+                    'Buffering ${track.id}: $bytesWritten / $totalBytes bytes ($pct %)');
+                sw.reset();
+              }
+            }
+
+            await sink.flush();
+            await sink.close();
+          } catch (streamErr) {
+            try {
+              await sink.close();
+            } catch (_) {}
+            if (await tempFile.exists()) {
+              await tempFile.delete();
+            }
+            throw Exception('Stream download error: $streamErr');
+          }
+
+          // Validate download completeness:
+          if (totalBytes > 0 && bytesWritten < (totalBytes * 0.98)) {
+            if (await tempFile.exists()) {
+              await tempFile.delete();
+            }
+            throw Exception(
+                'Incomplete download: received $bytesWritten of $totalBytes bytes (< 98%)');
+          }
+
+          // Validate audio header (first 12 bytes in hex):
+          final raf = await tempFile.open(mode: FileMode.read);
+          final headerBytes = await raf.read(12);
+          await raf.close();
+
+          final hexHeader = headerBytes
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(' ')
+              .toUpperCase();
+
+          AppLogger.info('AudioHandler',
+              'Downloaded ${track.id}: bytesWritten=$bytesWritten, totalBytes=$totalBytes, container=${streamData.container}, ext=$ext, header12=$hexHeader');
+
+          // MP4 header has 'ftyp' at bytes 4..8: [0x66, 0x74, 0x79, 0x70]
+          final isMp4 = headerBytes.length >= 8 &&
+              headerBytes[4] == 0x66 &&
+              headerBytes[5] == 0x74 &&
+              headerBytes[6] == 0x79 &&
+              headerBytes[7] == 0x70;
+
+          // WebM header starts with EBML ID: [0x1A, 0x45, 0xDF, 0xA3]
+          final isWebm = headerBytes.length >= 4 &&
+              headerBytes[0] == 0x1A &&
+              headerBytes[1] == 0x45 &&
+              headerBytes[2] == 0xDF &&
+              headerBytes[3] == 0xA3;
+
+          if (!isMp4 && !isWebm) {
+            if (await tempFile.exists()) {
+              await tempFile.delete();
+            }
+            throw Exception(
+                'Corrupt or non-audio file header: $hexHeader (expected MP4 ftyp or WebM 1A45DFA3)');
+          }
+
+          // Atomic rename: .part → final name
+          if (await cacheFile.exists()) await cacheFile.delete();
+          await tempFile.rename(cacheFile.path);
+
+          AppLogger.info('AudioHandler',
+              'Download verified: $bytesWritten bytes → ${cacheFile.path}');
+          verifiedFile = cacheFile;
+        } catch (attemptErr) {
+          AppLogger.warn('AudioHandler',
+              'Stream attempt $streamAttempt failed for ${track.id}: $attemptErr');
+          streamAttempt++;
+          if (streamAttempt >= maxStreamAttempts) {
+            rethrow;
+          }
         }
       }
 
-      await sink.flush();
-      await sink.close();
-
-      // Atomic rename: .part → final name
-      if (await cacheFile.exists()) await cacheFile.delete();
-      await tempFile.rename(cacheFile.path);
-
-      AppLogger.info('AudioHandler',
-          'Download complete: $bytesWritten bytes → ${cacheFile.path}');
+      if (verifiedFile == null) {
+        throw Exception('Failed to download a valid audio file after $streamAttempt attempts');
+      }
 
       if (_loadingTrackId != track.id) {
         AppLogger.info('AudioHandler', 'Track changed during download of ${track.id}, skipping auto-play');
         return;
       }
 
-      await _setSourceAndPlay(cacheFile.path, track);
+      await _setSourceAndPlay(verifiedFile.path, track);
       return;
     } catch (e, st) {
       if (!isRetry) {
@@ -228,12 +315,28 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   /// Helper: sets the audio source from a local file path and starts playback.
   Future<void> _setSourceAndPlay(String filePath, TrackInfo track) async {
-    await _player.setAudioSource(
-      AudioSource.file(filePath, tag: track.toMediaItem()),
-    );
-    await _player.play();
-    AppLogger.info('AudioHandler',
-        'Playback started for "${track.title}" from $filePath');
+    try {
+      await _player.setAudioSource(
+        AudioSource.file(filePath, tag: track.toMediaItem()),
+      );
+      await _player.play();
+      AppLogger.info('AudioHandler',
+          'Playback started for "${track.title}" from $filePath');
+    } catch (e, st) {
+      AppLogger.error('AudioHandler', 'setAudioSource failed for $filePath', e, st);
+      // On failure, delete that file if it lives in the cache dir (not a user download)
+      final cacheDir = await _cacheDir();
+      if (p.isWithin(cacheDir.path, filePath)) {
+        final corruptFile = File(filePath);
+        if (await corruptFile.exists()) {
+          AppLogger.warn('AudioHandler', 'Deleting corrupt cache file: $filePath');
+          try {
+            await corruptFile.delete();
+          } catch (_) {}
+        }
+      }
+      rethrow;
+    }
   }
 
   // ─── Cache helpers ───────────────────────────────────────────────────
@@ -256,7 +359,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         if (entry is File &&
             !entry.path.endsWith('.part') &&
             p.basenameWithoutExtension(entry.path) == sanitized &&
-            entry.lengthSync() > 10000) {
+            entry.lengthSync() >= 102400) {
           return entry;
         }
       }

@@ -80,43 +80,58 @@ class YoutubeMusicSource implements MusicSource {
   }
 
   Future<StreamManifest> _getStreamManifest(String videoId) async {
-    // 1. Try merged multi-client manifest (Android, iOS, AndroidVR, TV)
+    // 1. Android VR client alone
     try {
-      return await _yt.videos.streamsClient.getManifest(
+      final manifest = await _yt.videos.streamsClient.getManifest(
         videoId,
-        ytClients: [
-          YoutubeApiClient.android,
-          YoutubeApiClient.ios,
-          YoutubeApiClient.androidVr,
-          YoutubeApiClient.tv,
-        ],
+        ytClients: [YoutubeApiClient.androidVr],
       );
+      AppLogger.info('MusicSource', 'Resolved stream manifest for $videoId using [androidVr]');
+      return manifest;
     } catch (e1) {
-      AppLogger.warn('MusicSource', 'Merged ytClients manifest failed: $e1, trying Android client');
+      AppLogger.warn('MusicSource', 'Client [androidVr] failed for $videoId: $e1, trying [androidVr, tv]');
     }
 
-    // 2. Try Android client alone
+    // 2. Android VR + TV
     try {
-      return await _yt.videos.streamsClient.getManifest(
+      final manifest = await _yt.videos.streamsClient.getManifest(
         videoId,
-        ytClients: [YoutubeApiClient.android],
+        ytClients: [YoutubeApiClient.androidVr, YoutubeApiClient.tv],
       );
+      AppLogger.info('MusicSource', 'Resolved stream manifest for $videoId using [androidVr, tv]');
+      return manifest;
     } catch (e2) {
-      AppLogger.warn('MusicSource', 'Android client manifest failed: $e2, trying iOS client');
+      AppLogger.warn('MusicSource', 'Client [androidVr, tv] failed for $videoId: $e2, trying [ios]');
     }
 
-    // 3. Try iOS client alone
+    // 3. iOS client
     try {
-      return await _yt.videos.streamsClient.getManifest(
+      final manifest = await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [YoutubeApiClient.ios],
       );
+      AppLogger.info('MusicSource', 'Resolved stream manifest for $videoId using [ios]');
+      return manifest;
     } catch (e3) {
-      AppLogger.warn('MusicSource', 'iOS client manifest failed: $e3, trying default client');
+      AppLogger.warn('MusicSource', 'Client [ios] failed for $videoId: $e3, trying [android]');
     }
 
-    // 4. Fallback to default client
-    return await _yt.videos.streamsClient.getManifest(videoId);
+    // 4. Android client
+    try {
+      final manifest = await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.android],
+      );
+      AppLogger.info('MusicSource', 'Resolved stream manifest for $videoId using [android]');
+      return manifest;
+    } catch (e4) {
+      AppLogger.warn('MusicSource', 'Client [android] failed for $videoId: $e4, trying default client');
+    }
+
+    // 5. Default client
+    final manifest = await _yt.videos.streamsClient.getManifest(videoId);
+    AppLogger.info('MusicSource', 'Resolved stream manifest for $videoId using [default]');
+    return manifest;
   }
 
   @override
@@ -161,11 +176,15 @@ class YoutubeMusicSource implements MusicSource {
   }
 
   @override
-  Future<AudioStreamData> getAudioStreamData(String videoId) async {
-    AppLogger.info('MusicSource', 'Fetching audio stream data for: $videoId');
+  Future<AudioStreamData> getAudioStreamData(
+    String videoId, {
+    int attemptIndex = 0,
+    Set<String>? excludeUrls,
+  }) async {
+    AppLogger.info('MusicSource', 'Fetching audio stream data for: $videoId (attempt: $attemptIndex)');
     try {
       final manifest = await _getStreamManifest(videoId);
-      final allAudio = manifest.audioOnly.isNotEmpty
+      var allAudio = manifest.audioOnly.isNotEmpty
           ? manifest.audioOnly.toList()
           : manifest.muxed.toList();
       if (allAudio.isEmpty) {
@@ -182,16 +201,27 @@ class YoutubeMusicSource implements MusicSource {
         return b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond);
       });
 
-      final bestAudio = allAudio.first;
-      AppLogger.info('MusicSource', 'Selected stream for $videoId: ${bestAudio.container.name}, ${bestAudio.bitrate.bitsPerSecond} bps, ${(bestAudio.size.totalBytes / (1024 * 1024)).toStringAsFixed(2)} MB');
+      // Filter out excluded / previously failed URLs
+      if (excludeUrls != null && excludeUrls.isNotEmpty) {
+        final filtered = allAudio.where((s) => !excludeUrls.contains(s.url.toString())).toList();
+        if (filtered.isNotEmpty) {
+          allAudio = filtered;
+        }
+      }
 
-      final stream = _yt.videos.streamsClient.get(bestAudio);
+      final chosenIndex = attemptIndex.clamp(0, allAudio.length - 1);
+      final selectedAudio = allAudio[chosenIndex];
+      AppLogger.info('MusicSource',
+          'Selected stream #${chosenIndex + 1}/${allAudio.length} for $videoId: ${selectedAudio.container.name}, ${selectedAudio.bitrate.bitsPerSecond} bps, ${(selectedAudio.size.totalBytes / (1024 * 1024)).toStringAsFixed(2)} MB');
+
+      final stream = _yt.videos.streamsClient.get(selectedAudio);
       return AudioStreamData(
         stream: stream,
-        sizeBytes: bestAudio.size.totalBytes,
-        container: bestAudio.container.name,
-        bitrate: bestAudio.bitrate.bitsPerSecond,
-        url: bestAudio.url,
+        sizeBytes: selectedAudio.size.totalBytes,
+        container: selectedAudio.container.name,
+        bitrate: selectedAudio.bitrate.bitsPerSecond,
+        url: selectedAudio.url,
+        totalAvailableStreams: allAudio.length,
       );
     } catch (e, st) {
       AppLogger.error('MusicSource', 'Failed to get audio stream data for $videoId', e, st);
