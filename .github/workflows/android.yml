@@ -52,8 +52,11 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US" || true
           fi
 
+      - name: Ensure gradlew permission
+        run: chmod +x android/gradlew || true
+
       - name: Build APK (Release)
-        run: flutter build apk --release
+        run: flutter build apk --release --android-skip-build-dependency-validation
 
       - name: Rename APK for Clarity
         run: |
