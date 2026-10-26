@@ -4,6 +4,7 @@ import '../home/home_screen.dart';
 import '../library/library_screen.dart';
 import '../player/player_screen.dart';
 import '../search/search_screen.dart';
+import '../settings/settings_screen.dart';
 import 'main_scaffold.dart';
 
 final GlobalKey<NavigatorState> _rootNavigatorKey =
@@ -54,6 +55,13 @@ final appRouter = GoRouter(
           ],
         ),
       ],
+    ),
+
+    // Settings & Logs Screen
+    GoRoute(
+      path: '/settings',
+      parentNavigatorKey: _rootNavigatorKey,
+      builder: (context, state) => const SettingsScreen(),
     ),
 
     // Fullscreen Player Route with smooth slide-up animation

@@ -1,4 +1,5 @@
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import '../utils/app_logger.dart';
 import 'music_source.dart';
 
 class MusicSourceException implements Exception {
@@ -18,10 +19,14 @@ class YoutubeMusicSource implements MusicSource {
 
   @override
   Future<List<TrackInfo>> search(String query) async {
+    AppLogger.info('MusicSource', 'Searching YouTube for: "$query"');
     try {
       final searchResults = await _yt.search.getVideos(query);
-      return searchResults.map((video) => _mapVideoToTrack(video)).toList();
-    } catch (e) {
+      final list = searchResults.map((video) => _mapVideoToTrack(video)).toList();
+      AppLogger.info('MusicSource', 'Found ${list.length} results for "$query"');
+      return list;
+    } catch (e, st) {
+      AppLogger.error('MusicSource', 'YouTube search failed for "$query"', e, st);
       throw MusicSourceException('Failed to search tracks for "$query": $e', e);
     }
   }
@@ -76,6 +81,7 @@ class YoutubeMusicSource implements MusicSource {
 
   @override
   Future<AudioStreamInfoResult> getStreamUrl(String videoId) async {
+    AppLogger.info('MusicSource', 'Fetching stream manifest for: $videoId');
     try {
       final manifest = await _yt.videos.streamsClient.getManifest(videoId);
       final audioStreams = manifest.audioOnly;
@@ -84,13 +90,15 @@ class YoutubeMusicSource implements MusicSource {
       }
 
       final bestAudio = audioStreams.withHighestBitrate();
+      AppLogger.info('MusicSource', 'Resolved best audio stream: ${bestAudio.container.name}, ${bestAudio.bitrate.bitsPerSecond} bps, ${bestAudio.size.totalMegaBytes.toStringAsFixed(2)} MB');
       return AudioStreamInfoResult(
         url: bestAudio.url,
         bitrate: bestAudio.bitrate.bitsPerSecond,
         container: bestAudio.container.name,
         sizeBytes: bestAudio.size.totalBytes,
       );
-    } catch (e) {
+    } catch (e, st) {
+      AppLogger.error('MusicSource', 'Failed to get stream URL for $videoId', e, st);
       throw MusicSourceException('Failed to get audio stream URL for $videoId: $e', e);
     }
   }

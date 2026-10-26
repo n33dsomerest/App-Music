@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import '../../core/constants/app_constants.dart';
 import '../../core/database/app_database.dart';
+import '../../core/utils/app_logger.dart';
 import '../../core/utils/lrc_parser.dart';
 
 class LyricsData {
@@ -68,6 +69,7 @@ class LrclibService {
     try {
       final cached = await _database.getLyrics(videoId);
       if (cached != null) {
+        AppLogger.info('LrclibService', 'Found lyrics in DB cache for "$title" ($videoId)');
         final parsed = LrcParser.parse(cached.syncedLyrics);
         return LyricsData(
           videoId: videoId,
@@ -135,6 +137,10 @@ class LrclibService {
     }
 
     // 4. Cache in Drift Database
+    AppLogger.info(
+      'LrclibService',
+      'LRCLIB result for "$title": synced=${syncedLyrics != null}, plain=${plainLyrics != null}',
+    );
     await _database.cacheLyrics(
       videoId: videoId,
       plainLyrics: plainLyrics,

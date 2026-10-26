@@ -40,6 +40,12 @@ A high-performance, modern cross-platform music streaming and offline player app
    - Persistent mini-player bar above bottom navigation.
    - Declarative routing using `go_router`.
 
+6. **Settings & Diagnostics Log Viewer**:
+   - In-app live log inspector capturing audio events, stream resolutions, download queues, and network errors.
+   - Real-time search and filtering (Errors only, Warnings, Audio engine, Music source).
+   - One-tap **"Copy All Logs"** to clipboard for debugging and reporting issues.
+   - Individual log entry tap-to-copy and clear logs functionality.
+
 ---
 
 ## 🏗 Architecture & Tech Stack

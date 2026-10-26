@@ -1,6 +1,7 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import '../../core/audio/audio_service_provider.dart';
 import '../../core/sources/music_source.dart';
 import '../../core/theme/app_theme.dart';
@@ -30,6 +31,13 @@ class HomeScreen extends ConsumerWidget {
             const Text('MusicApl'),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: 'Settings & Logs',
+            onPressed: () => context.push('/settings'),
+          ),
+        ],
       ),
       body: RefreshIndicator(
         color: AppTheme.primaryLight,

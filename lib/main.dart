@@ -6,10 +6,19 @@ import 'core/audio/audio_service_provider.dart';
 import 'core/database/app_database.dart';
 import 'core/sources/youtube_music_source.dart';
 import 'core/theme/app_theme.dart';
+import 'core/utils/app_logger.dart';
 import 'features/navigation/app_router.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Global Flutter error catching to AppLogger
+  FlutterError.onError = (details) {
+    AppLogger.error('FlutterError', details.exceptionAsString(), details.exception, details.stack);
+    FlutterError.presentError(details);
+  };
+
+  AppLogger.info('App', 'App initialized');
 
   final database = AppDatabase();
   final musicSource = YoutubeMusicSource();

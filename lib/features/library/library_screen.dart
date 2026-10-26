@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import '../../core/audio/audio_service_provider.dart';
 import '../../core/theme/app_theme.dart';
 import '../download/download_providers.dart';
@@ -39,6 +40,13 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     return Scaffold(
       appBar: AppBar(
         title: const Text('Your Library'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: 'Settings & Logs',
+            onPressed: () => context.push('/settings'),
+          ),
+        ],
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: AppTheme.primaryLight,

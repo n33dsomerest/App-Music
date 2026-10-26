@@ -4,6 +4,7 @@ import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
 import '../database/app_database.dart';
 import '../sources/music_source.dart';
+import '../utils/app_logger.dart';
 
 class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final AudioPlayer _player = AudioPlayer();
@@ -104,6 +105,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   Future<void> _prepareAndPlayTrack(TrackInfo track, {bool isRetry = false}) async {
     _maxPositionReached = Duration.zero;
+    AppLogger.info('AudioHandler', 'Preparing track: "${track.title}" (${track.id}) ${isRetry ? "[RETRY]" : ""}');
 
     mediaItem.add(track.toMediaItem());
 
@@ -112,6 +114,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       if (track.localFilePath != null && track.localFilePath!.isNotEmpty) {
         final localFile = File(track.localFilePath!);
         if (await localFile.exists()) {
+          AppLogger.info('AudioHandler', 'Playing from local file: ${localFile.path}');
           await _player.setAudioSource(AudioSource.file(localFile.path));
           await _player.play();
           return;
@@ -125,6 +128,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
           downloadEntry.localFilePath.isNotEmpty) {
         final file = File(downloadEntry.localFilePath);
         if (await file.exists()) {
+          AppLogger.info('AudioHandler', 'Playing from offline DB download: ${file.path}');
           await _player.setAudioSource(AudioSource.file(file.path));
           await _player.play();
           return;
@@ -132,7 +136,9 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       }
 
       // 2. Stream online via MusicSource (resolves fresh stream URL)
+      AppLogger.info('AudioHandler', 'Resolving fresh online stream URL for ${track.id}...');
       final streamInfo = await _musicSource.getStreamUrl(track.id);
+      AppLogger.info('AudioHandler', 'Stream URL resolved (${streamInfo.bitrate} bps, ${streamInfo.container})');
       await _player.setAudioSource(
         AudioSource.uri(
           streamInfo.url,
@@ -140,12 +146,15 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         ),
       );
       await _player.play();
-    } catch (e) {
+      AppLogger.info('AudioHandler', 'Playback started successfully for "${track.title}"');
+    } catch (e, st) {
       if (!isRetry) {
+        AppLogger.warn('AudioHandler', 'Playback failed, refreshing stream and retrying... Error: $e');
         // Stream URLs can expire or get throttled; retry once with a refreshed URL
         await Future.delayed(const Duration(milliseconds: 500));
         return _prepareAndPlayTrack(track, isRetry: true);
       }
+      AppLogger.error('AudioHandler', 'Failed to play track "${track.title}" (${track.id})', e, st);
       rethrow;
     }
   }

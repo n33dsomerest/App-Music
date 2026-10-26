@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import '../../core/constants/app_constants.dart';
 import '../../core/database/app_database.dart';
 import '../../core/sources/music_source.dart';
+import '../../core/utils/app_logger.dart';
 
 enum DownloadStatus { pending, downloading, completed, failed }
 
@@ -101,6 +102,7 @@ class DownloadManager {
   Future<void> _downloadTrack(TrackInfo track) async {
     final cancelToken = CancelToken();
     _cancelTokens[track.id] = cancelToken;
+    AppLogger.info('DownloadManager', 'Starting download for: "${track.title}" (${track.id})');
 
     try {
       // 1. Mark as downloading
@@ -171,11 +173,13 @@ class DownloadManager {
 
         _activeProgress[track.id] = 1.0;
         _progressController.add(Map.unmodifiable(_activeProgress));
+        AppLogger.info('DownloadManager', 'Download complete: "${track.title}" (${(fileSize / (1024 * 1024)).toStringAsFixed(2)} MB)');
       } else {
         throw Exception('Downloaded file not found at $tempFilePath');
       }
-    } catch (e) {
+    } catch (e, st) {
       if (!cancelToken.isCancelled) {
+        AppLogger.error('DownloadManager', 'Download failed for "${track.title}" (${track.id})', e, st);
         await _database.updateDownloadStatus(
           videoId: track.id,
           status: 'failed',
