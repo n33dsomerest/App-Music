@@ -7,9 +7,12 @@ import 'package:path_provider/path_provider.dart';
 import '../database/app_database.dart';
 import '../sources/music_source.dart';
 import '../utils/app_logger.dart';
-import 'youtube_stream_audio_source.dart';
 
 class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  // No custom userAgent, no useProxyForRequestHeaders needed —
+  // we never send raw googlevideo.com URLs to ExoPlayer.
+  // All online audio is first downloaded to a local file by youtube_explode_dart,
+  // then played via AudioSource.file() which is 100% local.
   final AudioPlayer _player = AudioPlayer();
   final MusicSource _musicSource;
   final AppDatabase _database;
@@ -17,6 +20,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
   // Queue state tracking
   int _currentIndex = -1;
   final List<TrackInfo> _trackQueue = [];
+  String? _loadingTrackId;
 
   // Play logging tracking
   Duration _maxPositionReached = Duration.zero;
@@ -108,23 +112,30 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
 
   Future<void> _prepareAndPlayTrack(TrackInfo track, {bool isRetry = false}) async {
     _maxPositionReached = Duration.zero;
+    _loadingTrackId = track.id;
     AppLogger.info('AudioHandler', 'Preparing track: "${track.title}" (${track.id}) ${isRetry ? "[RETRY]" : ""}');
 
     mediaItem.add(track.toMediaItem());
 
+    // Emit a loading/buffering state so the UI shows a spinner
+    playbackState.add(playbackState.value.copyWith(
+      processingState: AudioProcessingState.loading,
+    ));
+
     try {
-      // 1. Check if track is available offline locally from downloads
+      // ── Step 1: Try playing from an existing local file ──
+
+      // 1a. Track model has a local path (e.g. from a download tile)
       if (track.localFilePath != null && track.localFilePath!.isNotEmpty) {
         final localFile = File(track.localFilePath!);
         if (await localFile.exists()) {
           AppLogger.info('AudioHandler', 'Playing from local file: ${localFile.path}');
-          await _player.setAudioSource(AudioSource.file(localFile.path, tag: track.toMediaItem()));
-          await _player.play();
+          await _setSourceAndPlay(localFile.path, track);
           return;
         }
       }
 
-      // Check DB for completed download if not in track model
+      // 1b. A completed download exists in the DB
       final downloadEntry = await _database.getDownload(track.id);
       if (downloadEntry != null &&
           downloadEntry.status == 'completed' &&
@@ -132,99 +143,140 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
         final file = File(downloadEntry.localFilePath);
         if (await file.exists()) {
           AppLogger.info('AudioHandler', 'Playing from offline DB download: ${file.path}');
-          await _player.setAudioSource(AudioSource.file(file.path, tag: track.toMediaItem()));
-          await _player.play();
+          await _setSourceAndPlay(file.path, track);
           return;
         }
       }
 
-      // 2. Check if track is cached in temporary cache directory
-      final cachedFile = await _getCacheFile(track.id);
-      if (await cachedFile.exists() && await cachedFile.length() > 1024) {
-        AppLogger.info('AudioHandler', 'Playing from local disk cache: ${cachedFile.path}');
-        await _player.setAudioSource(AudioSource.file(cachedFile.path, tag: track.toMediaItem()));
-        await _player.play();
+      // 1c. A previous stream-cache file exists on disk
+      final existingCache = await _findCacheFile(track.id);
+      if (existingCache != null && await existingCache.length() > 4096) {
+        AppLogger.info('AudioHandler', 'Playing from cached stream file: ${existingCache.path}');
+        await _setSourceAndPlay(existingCache.path, track);
         return;
       }
 
-      // 3. Stream directly using YoutubeStreamAudioSource
-      // Native YouTubeExplode streamClient handles chunks with verified headers,
-      // avoiding Google Video CDN HTTP 403 Forbidden blocks.
-      try {
-        AppLogger.info('AudioHandler', 'Opening verified audio stream via MusicSource for ${track.id}...');
-        final streamData = await _musicSource.getAudioStreamData(track.id);
-        final targetCacheFile = await _getCacheFile(track.id, streamData.container);
+      // ── Step 2: Download the audio stream to a temp file, then play ──
+      //
+      // youtube_explode_dart's streamsClient.get() performs the HTTP request
+      // using its own YoutubeHttpClient with the correct User-Agent, cookies,
+      // cipher/signature tokens etc.  The bytes arrive as a plain Dart
+      // Stream<List<int>>.  We write them to disk and hand the *local* file
+      // path to just_audio — ExoPlayer never touches googlevideo.com.
 
-        final source = YoutubeStreamAudioSource(
-          streamSupplier: () async => streamData.stream,
-          sourceLength: streamData.sizeBytes > 0 ? streamData.sizeBytes : null,
-          contentType: streamData.container.toLowerCase().contains('webm')
-              ? 'audio/webm'
-              : 'audio/mp4',
-          cacheFile: targetCacheFile,
-          tag: track.toMediaItem(),
-        );
+      AppLogger.info('AudioHandler', 'Downloading audio via youtube_explode for ${track.id}…');
+      final streamData = await _musicSource.getAudioStreamData(track.id);
+      final ext = (streamData.container.isNotEmpty) ? streamData.container : 'm4a';
+      final cacheFile = await _makeCacheFile(track.id, ext);
+      final tempFile  = File('${cacheFile.path}.part');
 
-        await _player.setAudioSource(source);
-        await _player.play();
-        AppLogger.info('AudioHandler', 'Verified stream playback started successfully for "${track.title}"');
-        return;
-      } catch (streamErr, streamSt) {
-        AppLogger.warn('AudioHandler', 'YoutubeStreamAudioSource encountered error ($streamErr), attempting candidate URL fallback...');
-      }
+      // Delete stale partial download if it exists
+      if (await tempFile.exists()) await tempFile.delete();
 
-      // 4. Fallback: Stream online via candidate URLs
-      AppLogger.info('AudioHandler', 'Resolving fallback online stream URLs for ${track.id}...');
-      final streamInfo = await _musicSource.getStreamUrl(track.id);
-      final urlsToTry = [streamInfo.url, ...streamInfo.fallbackUrls];
-      bool loaded = false;
-      Object? lastError;
+      final sink = tempFile.openWrite();
+      int bytesWritten = 0;
+      final totalBytes = streamData.sizeBytes;
+      final sw = Stopwatch()..start();
 
-      for (var i = 0; i < urlsToTry.length; i++) {
-        final candidateUrl = urlsToTry[i];
-        try {
-          AppLogger.info('AudioHandler', 'Attempting audio stream candidate (${i + 1}/${urlsToTry.length})');
-          await _player.setAudioSource(
-            AudioSource.uri(
-              candidateUrl,
-              tag: track.toMediaItem(),
-            ),
-          );
-          loaded = true;
-          break;
-        } catch (sourceErr) {
-          lastError = sourceErr;
-          AppLogger.warn('AudioHandler', 'Stream candidate ${i + 1} failed: $sourceErr');
+      await for (final chunk in streamData.stream) {
+        sink.add(chunk);
+        bytesWritten += chunk.length;
+
+        // Log progress every ~2 s so the user can see something in Settings
+        if (sw.elapsedMilliseconds > 2000) {
+          final pct = totalBytes > 0
+              ? ((bytesWritten / totalBytes) * 100).toStringAsFixed(0)
+              : '?';
+          AppLogger.info('AudioHandler',
+              'Buffering ${track.id}: $bytesWritten / $totalBytes bytes ($pct %)');
+          sw.reset();
         }
       }
 
-      if (!loaded) {
-        throw lastError ?? Exception('Failed to load any audio stream');
+      await sink.flush();
+      await sink.close();
+
+      // Atomic rename: .part → final name
+      if (await cacheFile.exists()) await cacheFile.delete();
+      await tempFile.rename(cacheFile.path);
+
+      AppLogger.info('AudioHandler',
+          'Download complete: $bytesWritten bytes → ${cacheFile.path}');
+
+      if (_loadingTrackId != track.id) {
+        AppLogger.info('AudioHandler', 'Track changed during download of ${track.id}, skipping auto-play');
+        return;
       }
 
-      await _player.play();
-      AppLogger.info('AudioHandler', 'Fallback URL playback started successfully for "${track.title}"');
+      await _setSourceAndPlay(cacheFile.path, track);
+      return;
     } catch (e, st) {
       if (!isRetry) {
-        AppLogger.warn('AudioHandler', 'Playback failed, refreshing stream and retrying... Error: $e');
-        await Future.delayed(const Duration(milliseconds: 500));
+        AppLogger.warn('AudioHandler',
+            'Playback/download failed, retrying once… Error: $e');
+        await Future.delayed(const Duration(milliseconds: 800));
         return _prepareAndPlayTrack(track, isRetry: true);
       }
-      AppLogger.error('AudioHandler', 'Failed to play track "${track.title}" (${track.id})', e, st);
-      rethrow;
+      AppLogger.error('AudioHandler',
+          'Failed to play track "${track.title}" (${track.id})', e, st);
+      playbackState.add(playbackState.value.copyWith(
+        processingState: AudioProcessingState.idle,
+        playing: false,
+      ));
     }
   }
 
-  Future<File> _getCacheFile(String trackId, [String extension = 'm4a']) async {
-    final tempDir = await getTemporaryDirectory();
-    final cacheDir = Directory(p.join(tempDir.path, 'music_apl_cache'));
-    if (!await cacheDir.exists()) {
-      await cacheDir.create(recursive: true);
-    }
-    final sanitizedId = trackId.replaceAll(RegExp(r'[^\w\.-]'), '_');
-    final ext = extension.isNotEmpty ? extension : 'm4a';
-    return File(p.join(cacheDir.path, '$sanitizedId.$ext'));
+  /// Helper: sets the audio source from a local file path and starts playback.
+  Future<void> _setSourceAndPlay(String filePath, TrackInfo track) async {
+    await _player.setAudioSource(
+      AudioSource.file(filePath, tag: track.toMediaItem()),
+    );
+    await _player.play();
+    AppLogger.info('AudioHandler',
+        'Playback started for "${track.title}" from $filePath');
   }
+
+  // ─── Cache helpers ───────────────────────────────────────────────────
+
+  Future<File> _makeCacheFile(String trackId, [String extension = 'm4a']) async {
+    final dir = await _cacheDir();
+    final sanitized = trackId.replaceAll(RegExp(r'[^\w\.-]'), '_');
+    final ext = extension.isNotEmpty ? extension : 'm4a';
+    return File(p.join(dir.path, '$sanitized.$ext'));
+  }
+
+  /// Looks for any cached file for [trackId], regardless of extension.
+  Future<File?> _findCacheFile(String trackId) async {
+    final dir = await _cacheDir();
+    final sanitized = trackId.replaceAll(RegExp(r'[^\w\.-]'), '_');
+    if (!await dir.exists()) return null;
+    try {
+      final entries = dir.listSync();
+      for (final entry in entries) {
+        if (entry is File &&
+            !entry.path.endsWith('.part') &&
+            p.basenameWithoutExtension(entry.path) == sanitized &&
+            entry.lengthSync() > 10000) {
+          return entry;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Directory? _cacheDirCached;
+  Future<Directory> _cacheDir() async {
+    if (_cacheDirCached != null) return _cacheDirCached!;
+    final tmp = await getTemporaryDirectory();
+    final dir = Directory(p.join(tmp.path, 'music_apl_cache'));
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    _cacheDirCached = dir;
+    return dir;
+  }
+
+  // ─── Play-history logging ────────────────────────────────────────────
 
   void _logCurrentTrackPlay({bool isCompleted = false}) {
     if (_currentIndex < 0 || _currentIndex >= _trackQueue.length) return;
@@ -251,6 +303,8 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     }
   }
 
+  // ─── Standard BaseAudioHandler overrides ─────────────────────────────
+
   @override
   Future<void> play() => _player.play();
 
@@ -274,7 +328,7 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
       _currentIndex++;
       await _prepareAndPlayTrack(_trackQueue[_currentIndex]);
     } else {
-      // Loop or stop
+      // End of queue
       await _player.seek(Duration.zero);
       await _player.pause();
     }
@@ -321,6 +375,8 @@ class MusicAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler 
     await _player.setShuffleModeEnabled(enabled);
     playbackState.add(playbackState.value.copyWith(shuffleMode: shuffleMode));
   }
+
+  // ─── Public getters ──────────────────────────────────────────────────
 
   AudioPlayer get player => _player;
   List<TrackInfo> get currentQueue => List.unmodifiable(_trackQueue);
